@@ -1,0 +1,44 @@
+# Build
+build/
+cmake-build-*/
+out/
+*.o
+*.obj
+*.exe
+*.so
+*.dll
+*.a
+*.lib
+# IDE
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+# Data and models (stored in Google Drive)
+data/*
+!data/README.md
+*.onnx
+*.engine
+*.trt
+*.pt
+*.pth
+*.ckpt
+runs/
+lightning_logs/
+results/
+# Profiling output
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+# Inspection logs
+*.db
+*.sqlite
+# Firmware
+firmware/**/.pio/

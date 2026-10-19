@@ -1,0 +1,11 @@
+# Desktop training environment (not for original Jetson Nano – see docs/jetson.md)
+torch
+torchvision
+anomalib
+opencv-python
+numpy
+matplotlib
+onnx
+onnxruntime
+jupyter
+ruff

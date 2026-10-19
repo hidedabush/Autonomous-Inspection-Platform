@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Feature work and tasks
+    url: https://www.atlassian.com/software/jira
+    about: Plan features and tasks on the Jira board, not GitHub issues.

@@ -1,0 +1,13 @@
+# Replace the @team handles with real GitHub usernames or teams.
+/src/cuda/        @aip-gpu-cuda
+/src/cpu/         @aip-gpu-cuda
+/benchmarks/      @aip-gpu-cuda
+/ml/              @aip-ml-cv
+/data/            @aip-ml-cv
+/firmware/        @aip-hardware
+/hardware/        @aip-hardware
+/src/app/         @aip-cpp-graphics
+/src/core/        @aip-cpp-graphics
+/src/ui/          @aip-cpp-graphics
+/src/hal/         @aip-cpp-graphics @aip-hardware
+/docs/interfaces.md @aip-cpp-graphics @aip-gpu-cuda @aip-ml-cv @aip-hardware
