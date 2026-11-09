@@ -25,6 +25,7 @@ venv/
 data/*
 !data/README.md
 *.onnx
+*.onnx.data
 *.engine
 *.trt
 *.pt

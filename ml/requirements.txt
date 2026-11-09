@@ -6,6 +6,8 @@ opencv-python
 numpy
 matplotlib
 onnx
+onnxscript   # anomalib's ONNX export needs it
 onnxruntime
+# Optional, for ml/export/verify_onnx.py --tensorrt on a desktop GPU: tensorrt-cu13 (or tensorrt-cu12)
 jupyter
 ruff

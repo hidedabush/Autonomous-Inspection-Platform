@@ -1,0 +1,419 @@
+AIP CHANGE LOG: TRAINING & TENSORRT PIPELINE
+As of 2026-11-09
+
+====================================================================================================
+SUMMARY
+====================================================================================================
+
+The repo can now train an anomaly-detection model, export it, and run it through TensorRT from
+C++: on the MVTec bottle set the FP16 engine scores 100% accuracy at 6.9 ms per image. The CMake
+CUDA fix is committed (2d7e31f); everything else is local and uncommitted, ready for review on a
+branch.
+
+How the pieces connect:
+
+  Python - desktop GPU in WSL
+  +--------------------+      +--------------------------+      +---------------------------+
+  | train_anomaly.py   | ---> | model.onnx               | ---> | verify_onnx.py            |
+  | PatchCore on MVTec |      | opset 18, 1x3x256x256    |      | accuracy + TensorRT match |
+  +--------------------+      +--------------------------+      +---------------------------+
+                                           |
+                                           | TensorRT build
+                                           v
+  C++ - on each target, desktop or Jetson
+  +----------------------+    +--------------------------+      +---------------------------+
+  | to_model_input       |    | model.fp16.engine        | ---> | TrtClassifier             |
+  | frame -> 256x256 NCHW|    | built per GPU (trtexec)  |      | score >= 0.5 -> FAIL      |
+  +----------------------+    +--------------------------+      +---------------------------+
+             |                         resized frame                          ^
+             +----------------------------------------------------------------+
+
+Training and checks run in Python on the desktop; each machine builds its own engine from the
+ONNX file, and the C++ classifier resizes frames and runs that engine.
+
+Date        Change                            One line
+----------  --------------------------------  ------------------------------------------------------
+2026-11-09  Code comments and this log        Detailed comments in every new file; this log saved
+                                              in docs/devlog/
+2026-11-09  Build system and repo hygiene     TensorRT is optional in CMake; new aip_trt library,
+                                              test, .gitignore and requirements.txt entries
+2026-11-09  C++ TensorRT classifier           aip::TrtClassifier and the aip_trt_infer tool run an
+                                              engine and return PASS/FAIL
+2026-11-09  C++ preprocessing                 aip::to_model_input resizes a camera frame into the
+                                              model's input format
+2026-11-09  Export check                      verify_onnx.py checks the ONNX model and builds and
+                                              compares a TensorRT engine
+2026-11-09  Training script                   train_anomaly.py trains PatchCore on MVTec, evaluates
+                                              it and exports ONNX
+2026-11-09  ML environment                    Training moved to WSL2 because Windows blocked the
+                                              Python ML stack
+2026-11-08  CMake CUDA fix                    CUDA builds failed on Windows and targeted the wrong
+                                              GPU; committed as 2d7e31f
+
+The entries below explain each change in the order it was made: the problem, what changed, and
+how it was checked.
+
+====================================================================================================
+ENTRY 1 - 2026-11-08 - CMake CUDA fix (committed as 2d7e31f)
+====================================================================================================
+
+CUDA builds now compile on Windows and target the RTX 4060's own architecture (sm_89). CI never
+caught either bug because it builds with -DAIP_ENABLE_CUDA=OFF.
+
+Problem 1: a C++ warning flag broke the CUDA compiler.
+  add_compile_options(/W4) applied to every language, so CMake also passed /W4 to nvcc. nvcc read
+  it as a second input file and stopped with "A single input file is required".
+
+Fix:
+  The flags are wrapped in a generator expression so they only reach C++ files:
+  $<$<COMPILE_LANGUAGE:CXX>:/W4> for MSVC and the same for -Wall -Wextra on GCC/Clang.
+
+Problem 2: the "native" architecture default never applied.
+  The code set CMAKE_CUDA_ARCHITECTURES to "native" only if it wasn't already defined, but it
+  checked after enable_language(CUDA). That call already fills in the compiler's default (sm_75),
+  so the "native" line never ran. The build ran on the 4060 only through slower just-in-time
+  compilation.
+
+Fix:
+  The default is now set before enable_language(CUDA), with a comment saying why the order
+  matters.
+
+Checked:
+  A Ninja build in the Visual Studio developer environment compiled grayscale.cu, the grayscale
+  test passed, and aip.exe printed CPU 1.6 ms vs CUDA 2.3 ms (including transfers) for a
+  1920x1080 frame.
+
+Still open:
+  The Visual Studio generator doesn't find CUDA on this machine because CUDA's MSBuild integration
+  files were never copied into Build Tools. Copying the 5 files from
+  CUDA\v13.3\extras\visual_studio_integration\MSBuildExtensions\ into
+  BuildTools\MSBuild\Microsoft\VC\v170\BuildCustomizations\ fixes it (needs admin).
+
+====================================================================================================
+ENTRY 2 - 2026-11-09 - ML environment moved to WSL2
+====================================================================================================
+
+Training runs in WSL2 Ubuntu, in ~/venvs/aip-ml, because the Windows .venv could not use the GPU
+or even import anomalib. No repo files changed in this step.
+
+Problem 1: no GPU in PyTorch.
+  The Windows .venv had torch 2.14.1+cpu, the CPU-only build. A plain "pip install torch" picks
+  it on Windows, so training would have ignored the RTX 4060.
+
+Problem 2: Windows blocked the ML stack.
+  Importing anomalib failed with "An Application Control policy has blocked this file" on a
+  scikit-learn DLL. That is Smart App Control (state 1, on), which blocks unsigned binaries. We
+  did not try to get around a security policy.
+
+What changed:
+  A new environment inside the existing WSL2 Ubuntu 26.04, where Linux binaries aren't checked by
+  Smart App Control and the GPU is passed through.
+  - uv installed to ~/.local/bin (no sudo)
+  - Python 3.12 via uv, because ML libraries support it better than 3.14 (PyTorch warns that
+    torch.jit.script may break on 3.14+)
+  - PyTorch 2.14.1 + CUDA 13.0 from the cu130 index, anomalib 2.7.0, onnx, onnxscript,
+    onnxruntime, OpenCV, ruff, TensorRT 10.16.1 (tensorrt-cu13)
+  - The venv lives on WSL's own disk because files under /mnt/c are slow from WSL; the repo and
+    dataset stay on Windows
+
+Why it is a good fit beyond the blockers:
+  WSL is Linux with CUDA, like the Jetson and like CI, so problems show up earlier.
+
+Checked:
+  torch.cuda.is_available() returned True with the device name
+  "NVIDIA GeForce RTX 4060 Laptop GPU".
+
+To use it:
+  source ~/venvs/aip-ml/bin/activate
+  cd /mnt/c/Users/admin/Downloads/aip-repo-skeleton/aip
+
+====================================================================================================
+ENTRY 3 - 2026-11-09 - Training script (ml/training/train_anomaly.py, new)
+====================================================================================================
+
+One command trains PatchCore on an MVTec category, evaluates it and exports an ONNX model; on
+"bottle" it reached image AUROC 1.0. This starts backlog tasks ML-10 (anomaly models on MVTec) and
+ML-14 (export to ONNX).
+
+Why PatchCore:
+  The ML README already planned "PatchCore (anomalib) on MVTec AD". PatchCore learns from good
+  parts only, so it needs no labelled defects. It stores features of normal image patches in a
+  memory bank and scores a new image by how far its patches are from that bank.
+
+What the script does, step by step:
+  1. Builds the model: Patchcore() or Padim() (--model), with an optional --backbone such as
+     resnet18 for a smaller Jetson model.
+  2. Loads the data with anomalib's MVTecAD datamodule: train/good for training, test/* for
+     evaluation.
+  3. Trains with Engine.fit (PatchCore "training" is one pass that fills the memory bank) and
+     evaluates with Engine.test.
+  4. Exports ONNX with Engine.export at a fixed 256x256 input.
+  5. Writes run_info.json beside the model: dataset, category, model, backbone, input size,
+     metrics and ONNX path, for the team's experiment log in Drive.
+
+What the exported model contains:
+  anomalib bakes its pre- and post-processing into the graph. The input is RGB scaled to 0-1, and
+  the model resizes and applies ImageNet normalization itself. The pred_score output is normalized
+  so 0.5 is the PASS/FAIL line.
+
+Bug found and fixed: batch size stuck at 2.
+  With a fixed image size, anomalib still marks the batch dimension as dynamic and traces it with
+  an example batch of 2. The exporter baked in 2, so a single image failed in ONNX Runtime with
+  "Got: 1 Expected: 2". The script now passes onnx_kwargs={"dynamic_shapes": None}, which makes
+  every shape static with batch 1. TensorRT is simplest with fixed shapes anyway.
+
+Opset note:
+  anomalib 2.7 only supports PyTorch's newer exporter, which produced opset 18. Its attempt to
+  convert down to 14 failed and the model stayed at 18. See Known issues.
+
+Output:
+  ml/runs/patchcore/bottle/ (git-ignored): weights/onnx/model.onnx (324 KB graph) plus
+  model.onnx.data (231 MB of weights, mostly the memory bank).
+
+====================================================================================================
+ENTRY 4 - 2026-11-09 - Export check (ml/export/verify_onnx.py and ml/export/README.md, new)
+====================================================================================================
+
+verify_onnx.py proves an exported model still works before anyone builds on it, and with
+--tensorrt proves TensorRT gives the same answers. It covers the desktop side of backlog task
+GPU-18 (TensorRT conversion).
+
+What it does:
+  1. Loads the ONNX file in ONNX Runtime and prints every input and output with its shape and
+     type. These are the values docs/interfaces.md sections 3 and 4 need.
+  2. Runs all 83 bottle test images and reports image-level AUROC, accuracy at the 0.5 threshold
+     and median latency. AUROC is computed directly (the share of good/defective pairs ranked
+     correctly), so it needs no scikit-learn.
+  3. With --tensorrt: builds an FP16 engine from the ONNX file with the TensorRT 10 Python API,
+     saves it as model.fp16.engine, runs the same images and reports the largest score difference
+     from ONNX Runtime and how many PASS/FAIL verdicts flip. --fp32 builds a full-precision engine
+     instead.
+  4. With --save-ppm DIR: saves two good and two defective test images as .ppm files for the C++
+     tool.
+
+Design choices:
+  - Images are resized with area averaging (cv2.INTER_AREA), the same method as the C++
+    to_model_input. Matching preprocessing is what lets the Python and C++ scores be compared at
+    all.
+  - The TensorRT runner uses PyTorch tensors as GPU buffers, so it needs no extra CUDA Python
+    package.
+  - It runs TensorRT on its own CUDA stream. The first version used the default stream and
+    TensorRT warned that this forces extra synchronization.
+
+ml/export/README.md documents the whole chain: train, verify, build the engine on the target with
+trtexec, run from C++. It also records the model contract (input 1x3x256x256 float32 RGB 0-1;
+outputs pred_score, pred_label, anomaly_map, pred_mask; opset 18) and why the original Jetson Nano
+can't load this export.
+
+====================================================================================================
+ENTRY 5 - 2026-11-09 - C++ preprocessing (aip::to_model_input, new)
+====================================================================================================
+
+aip::to_model_input(image, width, height) turns an 8-bit RGB camera frame into the exact tensor
+the model expects. It lives in aip_core, needs no TensorRT, and is tested in CI.
+
+Files:
+  include/aip/model_input.hpp, src/core/model_input.cpp, tests/test_model_input.cpp
+
+What it converts, using the bottle model as the example:
+
+            Input (aip::Image)            Output (std::vector<float>)
+  Size      any, e.g. 900x900             the model's, 256x256
+  Values    0-255, 8-bit                  0-1, float32
+  Layout    interleaved RGBRGB... (HWC)   planar: all R, then all G, then all B (NCHW)
+
+How the resize works:
+  Area averaging. Each output pixel is the average of the source pixels its area covers, with
+  partial pixels weighted by how much of them is covered. This keeps fine detail from aliasing
+  when shrinking a large frame, and it matches cv2.INTER_AREA used in Python.
+  - area_taps(src, dst) works out, once per axis, which source pixels feed each output pixel and
+    with what weight. The weights for one output pixel always add up to 1.
+  - The resize runs as two 1-D passes, first horizontal then vertical. That is much cheaper than
+    averaging a 2-D box for every pixel.
+  - The second pass writes straight into planar NCHW order, and a last loop divides by 255.
+
+Why it matters beyond TensorRT:
+  It is the CPU baseline for backlog task GPU-15 (GPU resize and normalize). The GPU team can
+  write the CUDA version and test it against this one, the same way the grayscale kernel is
+  checked against grayscale_cpu.
+
+The test checks three things:
+  1. Shrinking 4x2 to 2x1 averages each 2x2 block correctly, per channel.
+  2. Converting at the same size only rescales and reorders, so pixels land in the right plane
+     and position.
+  3. A flat image stays flat at an uneven scale (7x5 to 3x2), which proves the weights add up
+     to 1.
+
+====================================================================================================
+ENTRY 6 - 2026-11-09 - C++ TensorRT classifier (aip::TrtClassifier and aip_trt_infer, new)
+====================================================================================================
+
+aip::TrtClassifier runs a TensorRT engine and returns a PASS/FAIL InspectionResult; it implements
+the existing aip::Classifier interface, so the pipeline can use it without other changes. This
+starts backlog task CPP-19 (TensorRT backend integration).
+
+Files:
+  include/aip/trt_classifier.hpp, src/trt/trt_classifier.cpp, src/app/trt_infer.cpp
+
+The header hides TensorRT.
+  It uses the pimpl pattern: the class holds only a pointer to a private Impl struct defined in
+  the .cpp. Code that includes the header, such as the future dashboard, compiles without
+  TensorRT installed.
+
+Loading an engine (constructor):
+  1. Reads the .engine file into memory and deserializes it with a TensorRT runtime. If that
+     fails, the error explains the usual cause: engines only run on the GPU model and TensorRT
+     version that built them.
+  2. Walks every input and output tensor, records its name, shape and data type, and allocates
+     GPU memory for it with cudaMalloc.
+  3. Checks the model's shape: exactly one 1x3xHxW float32 input and a float32 pred_score output.
+     Anything else gives a clear error instead of wrong results later. A dynamic shape is rejected
+     with a hint to export at a fixed size.
+  4. Creates a dedicated CUDA stream.
+
+Classifying a frame (classify):
+  Resize with to_model_input, copy to the GPU, run the engine, copy the one pred_score float back,
+  wait for the stream. A score of 0.5 or more is FAIL. The result also carries the latency,
+  defect_class "anomaly" for a FAIL (real defect categories come with ML-18), and a confidence.
+  The confidence is derived from the normalized score, not a calibrated probability; calibration
+  is ML-19.
+
+Works with TensorRT 8 and 10.
+  TensorRT 8.5 introduced named input/output tensors and 10.0 removed the older binding-index API.
+  The original Jetson Nano is stuck on TensorRT 8.2, while the Orin Nano and the desktop use 10.
+  A compile-time switch, AIP_TRT_NAMED_TENSORS, picks getIOTensorName / setTensorAddress /
+  enqueueV3 on 8.5+ and getBindingName / a bindings array / enqueueV2 on older versions.
+
+Safe cleanup.
+  TensorRT objects must be destroyed in order: execution context, then engine, then runtime. They
+  are std::unique_ptr members declared in the reverse of that order, because C++ destroys members
+  bottom-up. GPU buffers and the stream are freed in Impl's destructor.
+
+aip_trt_infer tool:
+  aip_trt_infer <model.engine> <image.ppm> [...] prints the verdict, score and time for each image
+  after a warm-up run. It reads PPM (P6) images with a 20-line reader, so the project doesn't
+  need OpenCV yet.
+
+====================================================================================================
+ENTRY 7 - 2026-11-09 - Build system and repo hygiene
+====================================================================================================
+
+TensorRT is optional: machines with it build the classifier, and CI and CPU-only laptops build
+exactly as before.
+
+CMakeLists.txt
+  Change: new option AIP_ENABLE_TENSORRT (on by default). Looks for NvInfer.h, the nvinfer library
+          and the CUDA toolkit; sets AIP_HAS_TENSORRT only if all are found, otherwise prints a
+          message and carries on.
+  Why:    TensorRT needs only the CUDA runtime, not nvcc. TENSORRT_ROOT points at a custom
+          install, such as the extracted TensorRT zip on Windows; JetPack installs it
+          system-wide.
+
+src/CMakeLists.txt
+  Change: adds core/model_input.cpp to aip_core. New aip_trt library built only when TensorRT is
+          found, linked to nvinfer and CUDA::cudart.
+  Why:    keeps TensorRT out of aip_core, so CI never needs it. TensorRT headers are included as
+          SYSTEM so their warnings don't flood /W4.
+
+src/app/CMakeLists.txt
+  Change: builds aip_trt_infer when TensorRT is found.
+  Why:    same reason.
+
+tests/CMakeLists.txt
+  Change: registers the model_input test.
+  Why:    runs in CI with the grayscale test.
+
+.gitignore
+  Change: adds *.onnx.data.
+  Why:    large ONNX models keep their weights in a separate .onnx.data file (231 MB here), which
+          *.onnx doesn't match.
+
+ml/requirements.txt
+  Change: adds onnxscript; notes tensorrt-cu13 as optional.
+  Why:    anomalib's ONNX export fails without onnxscript; TensorRT is only for desktop checks.
+
+The new Python files were formatted with "ruff format" and pass "ruff check", as CONTRIBUTING.md
+asks and CI checks.
+
+====================================================================================================
+ENTRY 8 - 2026-11-09 - Detailed code comments and this log
+====================================================================================================
+
+Every file from entries 3-7 now carries comments that explain what each step does and why, so a
+teammate can follow the code without this log. No behaviour changed; the build, tests and ruff
+were re-run afterwards.
+
+What the comments cover:
+  - train_anomaly.py: how PatchCore and PaDiM differ, what "fit" means for PatchCore, what the
+    exported graph contains, why shapes are static.
+  - verify_onnx.py: why preprocessing must match C++, how the AUROC formula works, what each
+    TensorRT build setting does, why ONNX Runtime is the reference.
+  - model_input.hpp/.cpp: the exact output layout and index formula, the area-averaging windows
+    with a worked 900 -> 256 example, why the resize is split into two passes.
+  - trt_classifier.hpp/.cpp: usage, thread-safety, the TensorRT 8/10 switch, member destruction
+    order, what each step of loading and classify() does.
+  - trt_infer.cpp and test_model_input.cpp: the PPM format, the warm-up run, what each test value
+    proves.
+  - CMake files: why TensorRT is optional, library naming per platform, SYSTEM/PRIVATE/PUBLIC.
+
+This log is saved as docs/devlog/2026-11-09-training-and-tensorrt.txt.
+
+====================================================================================================
+VERIFICATION RESULTS
+====================================================================================================
+
+Every stage of the chain was run on the RTX 4060 laptop, and the TensorRT engine matched the
+reference model on all 83 bottle test images (63 defective).
+
+Training (PatchCore, wide_resnet50_2 backbone):
+  image AUROC 1.0, image F1 0.992, pixel AUROC 0.986, pixel F1 0.727.
+
+Python check, all 83 test images:
+
+  Runtime                     AUROC    Accuracy at 0.5   Median latency per image
+  ONNX Runtime (CPU)          1.0000   100%              199 ms
+  TensorRT FP16 (RTX 4060)    1.0000   100%              6.9 ms
+
+  TensorRT's scores were at most 0.016 from ONNX Runtime's, and no verdict flipped.
+
+C++ aip_trt_infer vs Python, same 4 images at full 900x900:
+
+  Image              Expected   Python ONNX score   C++ TensorRT score   C++ verdict
+  broken_large_000   FAIL       0.9684              0.9746               FAIL
+  broken_large_001   FAIL       0.9451              0.9473               FAIL
+  good_000           PASS       0.2567              0.2539               PASS
+  good_001           PASS       0.3463              0.3423               PASS
+
+  Each C++ call took about 7.6 ms, including the resize. The small score gaps come from FP16
+  precision.
+
+Builds and tests:
+  - Windows, MSVC with /W4: builds with no warnings, both tests pass, and CMake correctly skips
+    TensorRT because it isn't installed there.
+  - WSL, TensorRT 10.16: the full project including aip_trt and aip_trt_infer builds and both
+    tests pass. This used a temporary toolchain in ~/aip-trt-test (compiler, CMake and CUDA
+    headers from pip, TensorRT headers from NVIDIA's open-source repo), because installing real
+    tools with apt needs sudo.
+
+====================================================================================================
+KNOWN ISSUES AND FOLLOW-UPS
+====================================================================================================
+
+The biggest open question is which Jetson board arrives, because the current export only loads on
+an Orin Nano.
+
+[ ] Confirm the Jetson model. The export is ONNX opset 18. The Orin Nano (JetPack 6, TensorRT 10)
+    supports it; the original Nano (JetPack 4.6, TensorRT 8.2) supports opset 13 at most and
+    can't load it. The C++ classifier already compiles for both.
+[ ] Try a smaller model. The default backbone gives 231 MB of weights, heavy for a 4 GB board.
+    Retrain with --backbone resnet18 and compare accuracy and latency (ML-21).
+[ ] Install real build tools in WSL. Run "sudo apt install build-essential cmake" plus NVIDIA's
+    CUDA and TensorRT dev packages, then delete ~/aip-trt-test.
+[ ] Fix CUDA in Visual Studio builds. Copy CUDA's MSBuild integration files into Build Tools
+    (Entry 1).
+[ ] Agree the model contract. Fill docs/interfaces.md sections 3 and 4 from ml/export/README.md;
+    it needs sign-off from every team on those interfaces.
+[ ] Commit the work. Create a branch such as ML-10-patchcore-tensorrt, review the diff, commit
+    and open a pull request with one reviewer.
+[ ] Update CONTRIBUTING.md. It still describes the Jira workflow, but tasks now live in GitHub
+    Issues.
